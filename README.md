@@ -5,13 +5,26 @@ Its frozen first stage combines the trained V2 fusion model with the learned
 Laplacian adapter at epoch 8. The second stage refines its predicted depth with
 LIDF and the official specialized SPVNAS20G branch.
 
-**Release preparation is in progress.** The final second-stage checkpoint will
-be selected by evaluating all 80 epochs on all 1,226 ClearGrasp images and
-minimizing native-resolution, per-image **transparent-region MAE**. This is
+The selected release uses **frozen Laplacian E08 + LIDF/SPVNAS E58**. All 80
+epochs were evaluated on all 1,226 ClearGrasp images; E58 minimizes
+native-resolution, per-image **transparent-region MAE: 55.910374 mm**. This is
 explicitly **post hoc test-set selection**, not an independent test estimate.
-`configs/release.json` rejects inference until selection and portability checks
-have completed. The previously reported E63 result was selected on the 704-image
-validation set; it is not evidence that E63 wins this new comparison.
+The original 704-image validation winner remains E63 in the historical records.
+
+The portable Stage2 was evaluated on the same 1,226 frozen RGB predictions.
+Its transparent MAE differs by only **0.000000503 mm**; the largest macro MAE
+change across all 18 reported partitions is **0.000003381 mm**. These checks
+support the requested training release with approximately the same behavior.
+The original per-pixel 1e-6 m check remains recorded as **failed**: five of
+94,156,800 low-resolution pixels exceeded it. Old-code self-replays also show
+the same near-tied candidate selection jumps. Model operators and weights are
+preserved; numerical failure records are included, not relabeled as a pass.
+
+See the [complete experiment report](reports/FINAL_REPORT.zh-CN.md) for training
+curves, all checkpoint scores, region/domain metrics and verification evidence.
+Transparent-region selection improves the combined 1,226-image transparent MAE
+but does not improve every metric: all-image MAE is 73.036 mm versus 72.529 mm
+for the frozen first stage, and the original 521-image subset is reported separately.
 
 ## Pipeline
 
@@ -69,6 +82,8 @@ See [Stage1 reproduction](docs/stage1_reproduction.md) and
 [Stage2 runtime and training](docs/STAGE2_RUNTIME.md).
 
 Install this checkout in both environments with `python -m pip install -e .`.
+After moving or recloning it, rerun that command in both environments to update
+their editable installation paths.
 The top-level package itself imports neither PyTorch nor CUDA. Model modules are
 loaded only by their corresponding environment.
 
@@ -77,7 +92,8 @@ loaded only by their corresponding environment.
 User-trained weights are distributed through this private repository's release.
 Official upstream models are downloaded at pinned revisions, under their
 respective licenses. Authenticate `gh` for private release files and, where
-required, Hugging Face for upstream models, then run:
+required, Hugging Face for upstream models. Run the download command in the
+Stage1 environment, which includes the pinned Hugging Face client:
 
 ```bash
 python scripts/fetch_assets.py \
@@ -94,6 +110,12 @@ repository clone contains source and manifests, not the ClearGrasp dataset or
 large weight files.
 
 ## Inference
+
+Run the launcher from the activated Stage2 environment, with `CUDA_HOME`, `CC`
+and `CXX` set as described in the Stage2 runtime guide. Its `bin` directory must
+be on `PATH` so the installed Ninja build tool is available for kernel builds.
+The first call hashes the assets and builds local kernels; a cold start can
+take several minutes before producing an output.
 
 Create a calibration JSON file containing the native RGB image's 3×3 intrinsic
 matrix, then select the physical GPU explicitly:
@@ -156,13 +178,16 @@ transparent, and background metrics, real/synthetic breakdowns, and the original
 521-image test subset. The full 1,226 set includes images previously used for
 validation, so these results must not be described as held-out generalization.
 
-## Verification before upload
+## Verification scope
 
-The current `training_release` audit must establish:
+The `training_release` audit covers:
 
 1. Complete 80-checkpoint × 1,226-image selection, with authenticated identities.
-2. Complete 1,226-image same-P parity between the original winning model and
-   portable Stage2, followed by the same native depth and geometry evaluation.
+2. Complete 1,226-image comparison between the original winning model and
+   portable Stage2 on the same P, followed by native depth and geometry
+   evaluation. Original strict pixel failures and an explicit additional
+   approximate-quality review are both retained; see the report and
+   `audit/stage2_quality_acceptance.json`.
 3. Three actual old/new live RGB Stage1 cases, a relocated-checkout case, and
    twelve fresh RGB-only predictions using declared assets. Original CUDA
    `scatter_add` operators and weights are retained: 42 upstream/input fields
@@ -175,7 +200,10 @@ The current `training_release` audit must establish:
    nine optimizer updates per run covering all three curriculum phases, an
    epoch-boundary interruption/resume, finite gradients, updates to every
    trainable parameter group, and authenticated source/asset identities.
-5. A clean Git tree excluding dataset files, caches, credentials, and large
+5. Actual two-environment RGB+K inference from a relocated checkout, with
+   source/asset provenance and denial of original-project source reads
+   ([integration receipt](audit/cli_integration.json)).
+6. A clean Git tree excluding dataset files, caches, credentials, and large
    weights, with preserved third-party license and attribution files.
 
 Results and command receipts belong in `reports/`; an unfinished check is not a
@@ -190,6 +218,9 @@ profile, which requires a separate full live 1,226-image result. The explicit
 `--verification-profile training_release` instead requires `--stage1-acceptance`,
 `--single-training-acceptance`, and `--ddp-training-acceptance`; no live metrics
 are synthesized. `--asset-root` permits externally stored verified weights.
+The optional `--cached-quality-acceptance` requires a separate reviewed record
+and preserves the original strict failure. It is not a general skip-validation
+switch and is unavailable under `full_live`.
 
 Install `pytest` in both environments, then run their CPU checks explicitly:
 

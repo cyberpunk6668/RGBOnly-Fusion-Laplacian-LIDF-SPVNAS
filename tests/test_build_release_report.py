@@ -197,6 +197,23 @@ def test_training_release_does_not_invent_third_chain_or_hide_real_degradation()
     assert '### 新 RGB 实算' not in text and '不保证将来重新训练得到相同分数' in text
 
 
+def test_additional_quality_report_preserves_strict_failure_and_large_pixel_difference():
+    info = info_fixture(); del info['chains']['portable_live']
+    info['verification_profile'] = 'training_release'
+    info['cached_quality_acceptance'] = {'statistics': {'summary': {
+        'low_images_over_1e6': 5, 'low_pixels_over_1e6': 5, 'low_pixels': 1226 * 76800,
+        'max_low_abs_m': .05646, 'max_native_abs_m': .055,
+        'max_per_image_low_mean_abs_m': 8e-7, 'max_per_image_native_mean_abs_m': 9e-7},
+        'partitions': {'full1226/real/background': {'historical_mae_mm': 30.,
+            'portable_mae_mm': 30.001, 'signed_mae_change_mm': .001, 'metric_images': 100}}}}
+    flat, paired = report.metric_tables(info['chains'])
+    text = report.markdown(info, flat, paired)
+    assert '原严格数值验收失败' in text and '没有改写为严格通过' in text
+    assert '0.05646 m' in text and '用户没有逐项指定这些数值' in text
+    assert '同 P 全量验证通过' not in text
+    assert 'CPU resize' in text and 'full1226/real/background' in text
+
+
 def test_training_profile_must_be_explicit_and_complete():
     with pytest.raises(ValueError, match='full_live requires'):
         report.verification_profile(argparse.Namespace())

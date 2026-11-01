@@ -22,6 +22,14 @@ REGIONS = ('all', 'transparent', 'background')
 DOMAINS = ('combined', 'real', 'synthetic')
 CHAINS = ('historical_cached', 'portable_cached', 'portable_live')
 PROFILES = ('full_live', 'training_release')
+QUALITY_FAILURES = {'failed_cached_input_numerical_parity', 'failed_cached_input_metric_parity'}
+QUALITY_LIMITS = {'per_image_low_mean_abs_m': 1e-6, 'per_image_native_mean_abs_m': 1e-6,
+                  'per_image_low_over_1e6_fraction': 1e-4, 'total_low_over_1e6_fraction': 1e-6,
+                  'partition_mae_abs_change_mm': .01, 'refined_mask_disagree_pixels': 0}
+QUALITY_AUTHORIZATION = {'basis': 'latest_user_training_release_approximate_effect_scope',
+                         'numeric_limits_explicitly_specified_by_user': False,
+                         'operational_limits_defined_by': 'root', 'post_failure_policy': True,
+                         'automatically_relaxed': False}
 DEPTH_FIELDS = {'v2/0/output', 'lap/fixed_bands/0/output/0', 'lap/applied/0/output/depth', 'final_depth'}
 DIAGNOSTIC_FIELDS = {'lap/fixed_bands/0/output/1', 'lap/context/0/output', 'lap/mean_coeff/0/output',
     'lap/gates/gate_alpha', 'lap/gates/gate_delta', 'lap/gates/gate_regularization',
@@ -101,6 +109,8 @@ class Evidence:
 def verification_profile(args):
     profile = getattr(args, 'verification_profile', 'full_live')
     require(profile in PROFILES, 'Unknown verification profile')
+    require(getattr(args, 'cached_quality_acceptance', None) is None or profile == 'training_release',
+            'Cached quality acceptance is only available for explicit training_release')
     if profile == 'full_live':
         require(getattr(args, 'live_validation', None) is not None, 'full_live requires --live-validation')
     else:
@@ -445,9 +455,11 @@ def report_payload(root, marker, evidence, historical=False):
     return {'metrics': metrics, 'paired': paired, 'rows': rows, 'marker': marker}
 
 
-def portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref, evidence):
+def portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref, evidence, *, quality_measurement=False):
     marker = evidence.json(root / 'evaluation.complete.json')
-    require(marker.get('status') == 'complete' and marker.get('mode') == mode
+    allowed_status = marker.get('status') in QUALITY_FAILURES if quality_measurement else marker.get('status') == 'complete'
+    require(not quality_measurement or mode == 'cached', 'Quality measurement requires cached inputs')
+    require(allowed_status and marker.get('mode') == mode
             and marker.get('images') == 1226 and marker.get('test_images') == 521
             and marker.get('selected_epoch') == winner['epoch']
             and marker.get('selected_checkpoint_sha256') == winner['checkpoint_sha256']
@@ -455,7 +467,7 @@ def portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref
             and marker.get('test_informed_selection') is True
             and marker.get('independent_test_performance_claimed') is False,
             'Portable validation is incomplete, impure, or from another checkpoint')
-    if mode == 'cached':
+    if mode == 'cached' and not quality_measurement:
         require(marker.get('cached_input_parity_passed') is True and marker.get('cached_transparent_mae_agrees') is True
                 and marker.get('cached_transparent_mae_tolerance_mm') == 2e-5,
                 'Cached-input parity did not pass its original thresholds')
@@ -485,9 +497,21 @@ def portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref
           marker['transparent_mae_mm'] - marker['historical_cached_winner_transparent_mae_mm'],
           'Reported cached/live score change differs')
     if mode == 'cached':
-        require(seal.get('cached_input_parity_passed') is True
+        require((quality_measurement or seal.get('cached_input_parity_passed') is True)
                 and contract.get('cached_parity_abs_tolerance_m') == 1e-6
                 and contract.get('cached_parity_rtol') == 0., 'Cached array parity limits changed')
+        if quality_measurement:
+            require(marker.get('cached_input_parity_passed') == seal.get('cached_input_parity_passed')
+                    and type(seal.get('cached_input_parity_passed')) is bool
+                    and marker.get('cached_transparent_mae_tolerance_mm') == 2e-5,
+                    'Original strict comparison facts changed')
+            metric_pass = abs(marker['transparent_mae_change_vs_historical_mm']) <= 2e-5
+            expected_status = ('failed_cached_input_metric_parity' if not metric_pass
+                               else 'failed_cached_input_numerical_parity')
+            require(marker.get('cached_transparent_mae_agrees') is metric_pass
+                    and marker['status'] == expected_status
+                    and (not metric_pass or seal['cached_input_parity_passed'] is False),
+                    'Original strict failure is inconsistent with its unchanged thresholds')
     require(set(seal['workers']) == {str(i) for i in range(contract['world_size'])}, 'Missing prediction worker')
     require(set(marker['metric_shards']) == set(seal['workers']), 'Missing metric worker')
     for value in list(seal['workers'].values()) + list(seal['original_producer_attempts'].values()):
@@ -518,7 +542,197 @@ def portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref
     require(all(r['prediction_sha256'] == by_id[r['cache_id']]['prediction']['sha256'] for r in result['rows']),
             'Metrics reference different prediction bytes')
     result['contract'] = contract
+    result['predictions'] = predictions
     return result
+
+
+def cached_quality_statistics(predictions, historical_rows, portable_rows):
+    """Small sealed JSON only: no model, prediction arrays, or GT arrays read."""
+    validate_roster(predictions)
+    validate_roster(historical_rows, predictions)
+    validate_roster(portable_rows, predictions)
+    old = {r['cache_id']: r for r in historical_rows}
+    new = {r['cache_id']: r for r in portable_rows}
+    per_image, total_over, total_pixels, mask_errors = [], 0, 0, 0
+    for row in predictions:
+        identity = {key: row[key] for key in IDENTITY}
+        comparison = row['parity_against_cached_winner']
+        low, native = comparison['low'], comparison['native_vs_reference_cpu_resize']
+        for diff in (low, native):
+            require(diff.get('abs_tolerance_m') == 1e-6 and diff.get('rtol') == 0.
+                    and all(finite(diff[k]) and diff[k] >= 0 for k in ('max_abs_m', 'mae_m', 'rmse_m'))
+                    and 0 <= diff['bitwise_equal_fraction'] <= 1
+                    and type(diff['pixels_over_tolerance']) is int and diff['pixels_over_tolerance'] >= 0
+                    and diff['mae_m'] <= diff['max_abs_m'], 'Invalid sealed array-difference statistics')
+        low_pixels, native_pixels = 240 * 320, math.prod(row['native_hw'])
+        require(low['pixels_over_tolerance'] <= low_pixels and native['pixels_over_tolerance'] <= native_pixels,
+                'Pixel difference counts exceed array size')
+        mask = comparison['refined_mask_disagree_pixels']
+        require(type(mask) is int and 0 <= mask <= low_pixels
+                and comparison['passed'] is (low['pixels_over_tolerance'] == 0 and mask == 0),
+                'Strict per-image comparison facts are inconsistent')
+        total_over += low['pixels_over_tolerance']; total_pixels += low_pixels; mask_errors += mask
+        a, b = old[row['cache_id']], new[row['cache_id']]
+        verify_cross_chain_labels(a, b)
+        require(b['prediction_sha256'] == row['prediction']['sha256'], 'Quality metrics refer to other prediction bytes')
+        for region in REGIONS:
+            for method in METHODS:
+                aa, bb = a['metrics'][method][region], b['metrics'][method][region]
+                require(aa['pixels'] == bb['pixels'] and (aa['mae_mm'] is None) == (bb['mae_mm'] is None),
+                        'Quality comparison has different GT support')
+        per_image.append({**identity, 'low': low, 'native_vs_reference_cpu_resize': native,
+                          'low_pixels': low_pixels, 'native_pixels': native_pixels,
+                          'low_over_1e6_fraction': low['pixels_over_tolerance'] / low_pixels,
+                          'refined_mask_disagree_pixels': mask})
+    partitions = {}
+    for subset in ('full1226', 'test521'):
+        for domain in DOMAINS:
+            rows = [r for r in portable_rows if (subset == 'full1226' or r['official_split'].endswith('test'))
+                    and (domain == 'combined' or r['domain'] == domain)]
+            for region in REGIONS:
+                pairs = [(old[r['cache_id']]['metrics']['stage1_lidf'][region]['mae_mm'],
+                          r['metrics']['stage1_lidf'][region]['mae_mm']) for r in rows]
+                pairs = [(a, b) for a, b in pairs if a is not None]
+                require(all(finite(a) and finite(b) for a, b in pairs), 'Nonfinite paired quality metric')
+                before = math.fsum(a for a, _ in pairs) / len(pairs) if pairs else None
+                after = math.fsum(b for _, b in pairs) / len(pairs) if pairs else None
+                deltas = [b - a for a, b in pairs]
+                partitions[f'{subset}/{domain}/{region}'] = {
+                    'images': len(rows), 'metric_images': len(pairs),
+                    'pixels': sum(r['metrics']['stage1_lidf'][region]['pixels'] for r in rows),
+                    'historical_mae_mm': before, 'portable_mae_mm': after,
+                    'signed_mae_change_mm': None if not pairs else math.fsum(deltas) / len(deltas),
+                    'mean_abs_per_image_mae_change_mm': None if not pairs else math.fsum(map(abs, deltas)) / len(deltas),
+                    'max_abs_per_image_mae_change_mm': None if not pairs else max(map(abs, deltas))}
+    summary = {'images': len(per_image), 'test_images': sum(r['official_split'].endswith('test') for r in per_image),
+               'low_pixels': total_pixels, 'low_pixels_over_1e6': total_over,
+               'low_images_over_1e6': sum(r['low']['pixels_over_tolerance'] > 0 for r in per_image),
+               'total_low_over_1e6_fraction': total_over / total_pixels,
+               'max_per_image_low_over_1e6_fraction': max(r['low_over_1e6_fraction'] for r in per_image),
+               'max_per_image_low_mean_abs_m': max(r['low']['mae_m'] for r in per_image),
+               'max_per_image_native_mean_abs_m': max(r['native_vs_reference_cpu_resize']['mae_m'] for r in per_image),
+               'max_low_abs_m': max(r['low']['max_abs_m'] for r in per_image),
+               'max_native_abs_m': max(r['native_vs_reference_cpu_resize']['max_abs_m'] for r in per_image),
+               'refined_mask_disagree_pixels': mask_errors,
+               'native_comparison_definition': 'portable_native_vs_cpu_resize_of_historical_low',
+               'single_pixel_max_is_disclosed_without_relaxing_original_strict_gate': True}
+    return {'summary': summary, 'partitions': partitions, 'per_image': per_image}
+
+
+def quality_limit_checks(statistics):
+    s = statistics['summary']; limits = QUALITY_LIMITS
+    return {'per_image_low_mean': s['max_per_image_low_mean_abs_m'] <= limits['per_image_low_mean_abs_m'],
+            'per_image_native_mean': s['max_per_image_native_mean_abs_m'] <= limits['per_image_native_mean_abs_m'],
+            'per_image_low_fraction': s['max_per_image_low_over_1e6_fraction'] <= limits['per_image_low_over_1e6_fraction'],
+            'total_low_fraction': s['total_low_over_1e6_fraction'] <= limits['total_low_over_1e6_fraction'],
+            'mask_exact': s['refined_mask_disagree_pixels'] == 0,
+            'all_partition_mae': all(r['signed_mae_change_mm'] is None or
+                abs(r['signed_mae_change_mm']) <= limits['partition_mae_abs_change_mm']
+                for r in statistics['partitions'].values())}
+
+
+def assess_cached_quality(cached_root, historical_root, evidence=None):
+    """Return a proposed assessment, never an acceptance or release promotion."""
+    cached_root, historical_root = Path(cached_root), Path(historical_root)
+    evidence = evidence if evidence is not None else Evidence()
+    contract_ref = evidence.add(cached_root / 'contract.json'); contract = read(contract_ref['path'])
+    selection = contract['selection']
+    selected = read(evidence.check(selection['selection']))
+    verified = read(evidence.check(selection['verification']))
+    resolved = read(evidence.check(selection['resolved_selection']))
+    winner = validate_selection(selected, verified, resolved, selection['selection'], selection['verification'])
+    historical_ref = evidence.add(historical_root / 'evaluation.complete.json'); historical = read(historical_ref['path'])
+    require(historical.get('status') == 'complete' and historical.get('images') == 1226
+            and historical.get('test_images') == 521 and historical.get('selected_epoch') == winner['epoch']
+            and historical['selected_checkpoint'] == resolved['selected_checkpoint']
+            and historical['resolved_selection'] == selection['resolved_selection']
+            and historical['sweep_verification'] == selection['verification']
+            and historical.get('ground_truth_used_as_prediction_input') is False,
+            'Quality baseline is not the authenticated selected historical evaluation')
+    baseline = report_payload(historical_root, historical, evidence, historical=True)
+    dependencies = contract['dependencies']
+    portable = portable_payload(cached_root, 'cached', winner, selection['resolved_selection'],
+        dependencies['bundle_metadata'], dependencies['bundle_weights'], evidence, quality_measurement=True)
+    sweep = read(evidence.check(selection['sweep_contract']))
+    require(dependencies['input_manifest'] == sweep['input_manifest']
+            and dependencies['stage1_seal'] == sweep['stage1_seal']
+            and portable['marker']['labels']['sha256'] == sweep['label_manifest']['sha256'],
+            'Quality comparison used different inputs or labels from the selected sweep')
+    statistics = cached_quality_statistics(portable['predictions'], baseline['rows'], portable['rows'])
+    seal = read(cached_root / 'predictions.complete.json')
+    failed_ids = [r['cache_id'] for r in portable['predictions'] if not r['parity_against_cached_winner']['passed']]
+    require(seal['different_image_ids'] == failed_ids
+            and seal['different_from_historical_cached_input_images'] == len(failed_ids)
+            and seal['cached_input_parity_passed'] is (not failed_ids), 'Strict seal differs from per-image receipts')
+    proposal = {'schema': 'transparent_depth_cached_quality_statistics_v1', 'status': 'proposed',
+                'root_reviewed': False, 'model_executed': False, 'gt_arrays_read': False,
+                'authorization': QUALITY_AUTHORIZATION, 'limits': QUALITY_LIMITS,
+                'strict_numerical_parity_passed': False, 'strict_failure': evidence.add(cached_root / 'evaluation.complete.json'),
+                'original_strict_results': {'status': portable['marker']['status'],
+                    'cached_input_parity_passed': portable['marker']['cached_input_parity_passed'],
+                    'cached_transparent_mae_agrees': portable['marker']['cached_transparent_mae_agrees']},
+                'predictions_seal': evidence.add(cached_root / 'predictions.complete.json'),
+                'historical_evaluation': historical_ref, 'contract': contract_ref,
+                'selected_epoch': winner['epoch'], 'checkpoint_sha256': winner['checkpoint_sha256'],
+                'statistics': statistics, 'candidate_limit_checks': quality_limit_checks(statistics),
+                'evidence_sha256': dict(evidence.files)}
+    return proposal, portable
+
+
+def validate_cached_quality_acceptance(path, cached_root, historical_root, evidence=None):
+    """Shared report/external-CLI gate. Requires explicit root review, no final report."""
+    evidence = evidence if evidence is not None else Evidence()
+    record = evidence.json(path)
+    require(record.get('schema') == 'transparent_depth_cached_quality_acceptance_v1'
+            and record.get('status') == 'accepted' and record.get('root_reviewed') is True
+            and record.get('verification_profile') == 'training_release'
+            and record.get('strict_numerical_parity_passed') is False
+            and record.get('authorization') == QUALITY_AUTHORIZATION and record.get('limits') == QUALITY_LIMITS,
+            'Missing explicit training_release root-reviewed quality acceptance')
+    review = record.get('root_review', {})
+    require(review.get('reviewer') == '/root' and review.get('decision') == 'accept_training_release_approximate_quality'
+            and finite(review.get('reviewed_unix')) and review['reviewed_unix'] > 0
+            and isinstance(review.get('note'), str) and bool(review['note'].strip()),
+            'Quality acceptance requires a recorded affirmative root review')
+    proposal = read(evidence.check(record['proposed_statistics']))
+    actual, portable = assess_cached_quality(cached_root, historical_root)
+    require(proposal == actual, 'Quality statistics/inputs changed or were not generated from the complete sealed outputs')
+    require(record.get('strict_failure') == actual['strict_failure'], 'Original strict failure is not explicitly retained')
+    for source, digest in actual['evidence_sha256'].items():
+        require(evidence.add(source)['sha256'] == digest, 'Quality input evidence changed')
+    diagnostics = record.get('repeatability_evidence')
+    require(isinstance(diagnostics, list) and bool(diagnostics), 'Actual old self-repeatability evidence is required')
+    observed_comparison = False
+    for diagnostic in diagnostics:
+        value = read(evidence.check(diagnostic))
+        if (value.get('status') == 'completed_diagnostic_not_acceptance'
+                and value.get('original_tolerance_m') == 1e-6
+                and (value.get('original_strict_numerical_failure_preserved') is True
+                     or value.get('original_failed_acceptance_not_overridden') is True)):
+            observed_comparison = True
+            if value.get('schema') == 'stage2_hard_argmax_repeatability_observation_v1':
+                require(value.get('labels_read') is False and value.get('model_state_exact_to_original_checkpoint') is True
+                        and len(value['execution']['runs']) == 2
+                        and all(r['returncode'] == 0 for r in value['execution']['runs']),
+                        'Repeatability evidence lacks completed pure model execution')
+                for mode in ('old', 'portable'):
+                    detail = value['runtime_details'][mode]
+                    require(detail['checkpoint']['sha256'] == actual['checkpoint_sha256']
+                            and detail['contract'] == actual['contract']
+                            and detail.get('model_state_exact_to_original_checkpoint') is True
+                            and detail.get('labels_read') is False and detail.get('mathematical_operators_changed') is False,
+                            'Repeatability observation belongs to a different model/input contract')
+    require(observed_comparison, 'Repeatability diagnostic must preserve the original strict failure and tolerance')
+    require(review.get('repeatability_evidence_reviewed') is True,
+            'Root must review actual repeatability evidence, not assume a cause')
+    recoveries = record.get('orchestration_recovery_evidence', [])
+    require(isinstance(recoveries, list), 'Orchestration recovery evidence must be explicit artifact references')
+    for recovery in recoveries:
+        evidence.check(recovery)
+    require(all(actual['candidate_limit_checks'].values()), 'A partition/mean/fraction/mask quality limit failed')
+    return {'acceptance': record, 'reference': evidence.add(path), 'statistics': actual['statistics'],
+            'portable_payload': portable, 'status': 'accepted_approximate_quality',
+            'strict_numerical_parity_passed': False}
 
 
 def training_rows(root, ranked, evidence):
@@ -752,11 +966,22 @@ def collect(args):
     close(historical_marker['transparent_mae_mm'], resolved['scores'][str(winner['epoch'])]['transparent_mae_mm'],
           'Historical geometry score differs', 2e-5)
     chains = {'historical_cached': report_payload(args.historical_geometry, historical_marker, evidence, historical=True)}
+    quality = None
+    if getattr(args, 'cached_quality_acceptance', None) is not None:
+        quality = validate_cached_quality_acceptance(args.cached_quality_acceptance,
+            args.cached_validation, args.historical_geometry, evidence)
     portable = [('portable_cached', args.cached_validation, 'cached')]
     if profile == 'full_live':
         portable.append(('portable_live', args.live_validation, 'live'))
     for name, root, mode in portable:
-        chains[name] = portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref, evidence)
+        chains[name] = (quality['portable_payload'] if mode == 'cached' and quality is not None else
+                       portable_payload(root, mode, winner, resolved_ref, metadata_ref, weights_ref, evidence))
+        require(chains[name]['marker']['selected_epoch'] == winner['epoch']
+                and chains[name]['marker']['selected_checkpoint_sha256'] == winner['checkpoint_sha256']
+                and chains[name]['contract']['selection']['resolved_selection'] == resolved_ref
+                and chains[name]['contract']['dependencies']['bundle_metadata'] == metadata_ref
+                and chains[name]['contract']['dependencies']['bundle_weights'] == weights_ref,
+                'Cached quality acceptance does not match this final release bundle')
         validate_roster(chains[name]['rows'], chains['historical_cached']['rows'])
         dependency = chains[name]['contract']['dependencies']
         require(dependency['input_manifest'] == sweep_contract['input_manifest']
@@ -790,7 +1015,8 @@ def collect(args):
     return {'evidence': evidence, 'selection': selection, 'resolved': resolved, 'winner': winner,
             'release_config': config, 'chains': chains, 'selection_rows': selection_rows,
             'epochs': epochs, 'training': training, 'verification_profile': profile,
-            'training_release_acceptance': acceptance, 'asset_root': str(assets)}
+            'training_release_acceptance': acceptance, 'cached_quality_acceptance': quality,
+            'asset_root': str(assets)}
 
 
 def number(value, digits=6):
@@ -830,8 +1056,28 @@ def markdown(info, flat, paired):
                    'portable_live': 'RGB 实算第一阶段后的实际两阶段发布效果'}[name]
         lines_out.append(f"| {LABELS[name]} | {meaning} | {number(chains[name]['marker']['transparent_mae_mm'], 9)} |")
     cached = chains['portable_cached']['marker']
-    lines_out += ['', f"同 P 全量验证通过：低分辨率深度绝对容差 10⁻⁶ m、refined mask 精确一致，"
-                  f"透明 MAE 差 {cached['transparent_mae_change_vs_historical_mm']:+.9g} mm，原上限 2×10⁻⁵ mm。"]
+    quality = info.get('cached_quality_acceptance')
+    if quality is None:
+        lines_out += ['', f"同 P 全量验证通过：低分辨率深度绝对容差 10⁻⁶ m、refined mask 精确一致，"
+                      f"透明 MAE 差 {cached['transparent_mae_change_vs_historical_mm']:+.9g} mm，原上限 2×10⁻⁵ mm。"]
+    else:
+        stats = quality['statistics']; summary = stats['summary']
+        lines_out += ['', '**Stage2 原严格数值验收失败，原失败 marker 和阈值完整保留；没有改写为严格通过。**',
+            '本 training_release 采用独立的近似质量接受记录，依据用户最新“后续训练效果差不多、重点整理上传”的范围。'
+            '下列操作界限由 root 在严格失败后提出并审核，用户没有逐项指定这些数值；不是自动放宽单像素最大误差。',
+            f"原 10⁻⁶ m 阈值下，低分辨率共有 {summary['low_images_over_1e6']} 张、"
+            f"{summary['low_pixels_over_1e6']}/{summary['low_pixels']} 像素超限；"
+            f"最大单像素差 {summary['max_low_abs_m']:.9g} m，原生对照最大差 {summary['max_native_abs_m']:.9g} m。",
+            f"逐图平均绝对差的最大值：低分辨率 {summary['max_per_image_low_mean_abs_m']:.9g} m，"
+            f"原生对照 {summary['max_per_image_native_mean_abs_m']:.9g} m，均不超过 10⁻⁶ m。"
+            '原生数组差的参照是历史低分辨率预测的 CPU resize；GT 质量另由两边实际原生评测逐图对齐。',
+            '每图低分辨率超限比例≤10⁻⁴、总体≤10⁻⁶，refined mask 精确一致；'
+            '完整1226／521×合并／真实／合成×全图／透明／背景的宏平均 MAE 差均≤0.01 mm。'
+            '旧版自身重复的原始证据单独封存；近似质量接受不宣称逐像素相等或未来训练轨迹相等。', '',
+            '| 子集/域/区域 | 原 MAE mm | 新 MAE mm | 新−原 mm | 有效图数 |', '|---|---:|---:|---:|---:|']
+        for name, row in stats['partitions'].items():
+            lines_out.append(f"| {name} | {number(row['historical_mae_mm'], 9)} | {number(row['portable_mae_mm'], 9)} | "
+                             f"{number(row['signed_mae_change_mm'], 9)} | {row['metric_images']} |")
     if 'portable_live' in chains:
         live_delta = chains['portable_live']['marker']['transparent_mae_mm'] - chains['historical_cached']['marker']['transparent_mae_mm']
         lines_out += [f"真实新 RGB 链相对历史胜者的透明 MAE 差为 {live_delta:+.9g} mm。"
@@ -845,7 +1091,8 @@ def markdown(info, flat, paired):
                       '第一阶段保留原算子与权重。用户确认的固定验收为：42 项专家/V2输入等字段 exact；'
                       '4 项米制 V2/后续深度分别满足最大绝对差≤5×10⁻⁵ m、平均绝对差≤10⁻⁶ m；'
                       '9 项非米制中间量只要求有限值和相同 schema，不宣称 exact。'
-                      'CUDA scatter 归约重复性证据与原零容差失败保留；该规则不放宽 Stage2 同 P 的原阈值。']
+                      'CUDA scatter 归约重复性证据与原零容差失败保留；Stage1 规则不用于替代 Stage2 验收，'
+                      'Stage2 严格结果与任何独立附加质量接受记录均分别披露。']
     lines_out += ['',
                   '## 域与几何差异', '',
                   '以下比较均为 LIDF 输出减去同一链的原生 E08；MAE、RMSE、AbsRel、法线角误差越低越好，边缘 F1 越高越好。'
@@ -980,6 +1227,10 @@ def build(args):
         write_csv(stage / 'training_80_epochs.csv', info['epochs'])
         write_csv(stage / 'metrics_all.csv', flat)
         write_csv(stage / 'paired_ci.csv', paired)
+        quality = info.get('cached_quality_acceptance')
+        if quality is not None:
+            (stage / 'cached_quality_statistics.json').write_text(json.dumps(
+                quality['statistics'], ensure_ascii=False, indent=2, allow_nan=False) + '\n')
         (stage / 'FINAL_REPORT.zh-CN.md').write_text(markdown(info, flat, paired), encoding='utf-8')
         plots(stage, info)
         evidence = info['evidence']
@@ -994,6 +1245,9 @@ def build(args):
                   'full_roster_chains': list(info['chains']),
                   'full_live_1226_executed': 'portable_live' in info['chains'],
                   'training_release_acceptance': info['training_release_acceptance'],
+                  'cached_acceptance_kind': 'strict_original_thresholds' if quality is None else 'accepted_approximate_quality',
+                  'cached_strict_numerical_parity_passed': quality is None,
+                  'cached_quality_acceptance': None if quality is None else quality['reference'],
                   'asset_root': info['asset_root'],
                   'selected_epoch': info['winner']['epoch'], 'checkpoint_sha256': info['winner']['checkpoint_sha256'],
                   'selection_is_test_informed': True, 'independent_test_estimate': False,
@@ -1020,6 +1274,8 @@ def main():
     parser.add_argument('--stage1-acceptance', type=Path, help='Three-case + relocation + fresh12 complete.json')
     parser.add_argument('--single-training-acceptance', type=Path)
     parser.add_argument('--ddp-training-acceptance', type=Path)
+    parser.add_argument('--cached-quality-acceptance', type=Path,
+                        help='Explicit root-reviewed additional quality acceptance; training_release only, preserves strict failures')
     parser.add_argument('--asset-root', type=Path, help='Explicit external asset directory; overrides release config default')
     args = parser.parse_args()
     try:

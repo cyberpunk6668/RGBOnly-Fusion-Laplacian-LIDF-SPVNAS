@@ -52,7 +52,7 @@ numerical parity; the separately recorded GPU acceptance does.
 ```bash
 python -m transparent_depth.stage2 \
   --rgb example.png --depth-input stage1_native.npy \
-  --intrinsics camera.json --bundle artifacts/stage2 \
+  --intrinsics camera.json --bundle /data/transparent-depth-assets/stage2 \
   --output final_native.npy --device cuda:0
 ```
 
@@ -81,8 +81,9 @@ alpha1, 30 epochs linearly decreasing from1 to0, then30 epochs alpha0. Each epoc
 covers all45,453 training images. Batch2/GPU, accumulation5 gives an effective
 batch30 and1,516 optimizer updates/epoch (partial final accumulation uses its
 actual microbatch count). Adam rates are1e-4 for LIDF and SPVNAS,1e-3 for adapters;
-StepLR decays at epoch60. Both dense and sparse TF32 are disabled, forward uses
-FP32 without autocast, and no gradient clipping is added.
+StepLR decays after epoch60, so the reduced rates apply from epoch61. Both dense
+and sparse TF32 are disabled, forward uses FP32 without autocast, and no gradient
+clipping is added.
 
 The training input is `P + alpha*(G-P)` only at valid nontransparent GT pixels.
 Transparent pixels and invalid GT always use P. Training uses GT background
@@ -91,7 +92,21 @@ validation uses pure P. The diagnostic phase-matched validation is explicitly
 label-conditioned when alpha>0 and never selects a checkpoint. Only epochs51–80
 are eligible for best.pt, using704-image native full-image mean AbsRel.
 
-First create three separate CSV/JSONL rosters. The RGB-only Stage1 roster has
+To reuse the audited ClearGrasp split without manually writing the rosters, run
+this command from the repository root:
+
+```bash
+python scripts/prepare_cleargrasp_rosters.py \
+  --data-root /your/data --output outputs/cleargrasp
+```
+
+It creates `rgb_only.jsonl`, `input_roster.jsonl` and a separate `label_roster.jsonl`
+for the commands below. The compressed reference preserves original native K,
+sample order and calibration flags. See the [dataset preparation guide](../data/cleargrasp_reference/README.md)
+for the expected directory layout, rectified-Z requirement and optional RGB SHA
+verification. This metadata command does not open GT arrays.
+
+For custom data, create three separate CSV/JSONL rosters. The RGB-only Stage1 roster has
 `sample_id`, `rgb_path`, `rgb_sha256`, and optional `native_hw`. The Stage2 input
 roster contains `sample_id`, `rgb_path`, native `intrinsics` (3×3),
 `pixel_convention: "integer_pixel_centres"`, `role` (`train`, `val`, or
@@ -105,39 +120,35 @@ their corresponding roster. A validation/evaluation sample can share an ID and
 prediction; training IDs must remain separate.
 
 Generate actual Stage1 predictions in the Stage1 environment. Stage1 accepts
-only the RGB roster and cannot read K, roles or label paths:
+only the RGB roster and cannot read K, roles or label paths. These commands use
+the asset directory from the root README; official Stage2 initialization assets
+are downloaded into its separate `stage2_initialization` subdirectory:
 
 ```bash
 # Stage1 environment: use the expected number of unique RGB sample IDs.
 CUDA_VISIBLE_DEVICES=0 python -m transparent_depth.stage1_batch predict \
-  --manifest data/rgb_only.jsonl --output caches/native_p \
-  --asset-root artifacts --rank 0 --world 1 --device cuda:0 \
+  --manifest outputs/cleargrasp/rgb_only.jsonl --output outputs/caches/cleargrasp_p \
+  --asset-root /data/transparent-depth-assets --rank 0 --world 1 --device cuda:0 \
   --expected-count 46679
 python -m transparent_depth.stage1_batch seal \
-  --manifest data/rgb_only.jsonl --output caches/native_p \
-  --asset-root artifacts --rank 0 --world 1 --device cuda:0 \
+  --manifest outputs/cleargrasp/rgb_only.jsonl --output outputs/caches/cleargrasp_p \
+  --asset-root /data/transparent-depth-assets --rank 0 --world 1 --device cuda:0 \
   --expected-count 46679
 # Stage2 environment: authenticate the producer, then create separate caches.
 python -m transparent_depth.prepare_stage2_data \
-  --input-roster data/rgb_k.jsonl --label-roster data/labels.jsonl \
-  --predictions caches/native_p/predictions.jsonl --output caches/prepared
-python scripts/fetch_stage2_initialization.py --output artifacts/stage2_initialization
+  --input-roster outputs/cleargrasp/input_roster.jsonl \
+  --label-roster outputs/cleargrasp/label_roster.jsonl \
+  --predictions outputs/caches/cleargrasp_p/predictions.jsonl --output outputs/caches/stage2
+python scripts/fetch_stage2_initialization.py \
+  --output /data/transparent-depth-assets/stage2_initialization
 CUDA_VISIBLE_DEVICES=5,6,7 torchrun --standalone --nproc-per-node=3 \
   -m transparent_depth.train_stage2 --config configs/stage2_train.json \
-  --input-manifest caches/prepared/manifests/input_manifest.jsonl \
-  --label-manifest caches/prepared/manifests/label_manifest.jsonl \
-  --stage1-root caches/prepared/stage1 --label-root caches/prepared/labels \
-  --assets-root artifacts/stage2_initialization --output runs/stage2
+  --input-manifest outputs/caches/stage2/manifests/input_manifest.jsonl \
+  --label-manifest outputs/caches/stage2/manifests/label_manifest.jsonl \
+  --stage1-root outputs/caches/stage2/stage1 --label-root outputs/caches/stage2/labels \
+  --assets-root /data/transparent-depth-assets/stage2_initialization --output runs/stage2
 # Repeat the same training command with --resume for the committed epoch.
 ```
-
-To reuse the audited ClearGrasp split without manually writing the rosters, run
-`python scripts/prepare_cleargrasp_rosters.py --data-root /your/data --output outputs/cleargrasp`.
-Use its `rgb_only.jsonl`, `input_roster.jsonl` and separate `label_roster.jsonl`
-with the commands above. The compressed reference preserves original native K,
-sample order and calibration flags. See the [dataset preparation guide](../data/cleargrasp_reference/README.md)
-for the expected directory layout, rectified-Z requirement and optional RGB SHA
-verification. This metadata command does not open GT arrays.
 
 The count46679 follows the historical released roster:45453 training samples plus
 1226 evaluation identities, with704 validation identities included in evaluation.
@@ -181,7 +192,7 @@ CUDA_HOME=/your/cuda-12.1 CC=gcc-11 CXX=g++-11 \
 python scripts/run_stage2_smoke.py \
   --input-roster data/smoke_rgb_k.jsonl --label-roster data/smoke_labels.jsonl \
   --predictions caches/smoke_native_p/predictions.jsonl \
-  --assets-root artifacts/stage2_initialization --output runs/training_smoke \
+  --assets-root /data/transparent-depth-assets/stage2_initialization --output runs/training_smoke \
   --gpus 4 --wait-timeout 21600
 ```
 
@@ -232,3 +243,18 @@ exactly; the maximum relative difference across scalar metrics and sums was
 4.37e-9. This verifies the metric adapter on those two images only. It does not
 constitute Stage2 CUDA model parity or a new quality result. The reproducible
 check is scripts/validate_stage2_metrics.py.
+
+For release E58, the complete same-P comparison covers all 1,226 images.
+Transparent MAE is 55.9103744437 mm versus the historical 55.9103739407 mm;
+all 18 subset/domain/region MAE changes are below 0.000003381 mm. The original
+1e-6 m per-pixel check is still recorded as failed: five low-resolution pixels
+exceed it, with a maximum difference of 56.46 mm. Each image's mean absolute
+prediction difference remains below 0.001 mm and every refined mask matches.
+Plain old-code self-replays reproduce the same near-tied hard-argmax jumps;
+the numerical sources and full model state were preserved.
+
+The additional quality review follows the requested approximately matching
+training behavior. It is separate from strict pixel parity and does not change
+model operators, weights or the original failure. See the final report and
+`audit/stage2_quality_acceptance.json` for the operational limits, complete
+partition comparisons, repeatability traces and explicitly reviewed scope.

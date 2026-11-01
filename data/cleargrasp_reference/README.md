@@ -67,10 +67,10 @@ for this prediction manifest:
 # Select authorized physical devices explicitly in the environment.
 /envs/stage1/bin/python -m transparent_depth.stage1_batch predict \
   --manifest outputs/cleargrasp/rgb_only.jsonl --output outputs/caches/cleargrasp_p \
-  --asset-root artifacts --rank 0 --world 1 --device cuda:0 --expected-count 46679
+  --asset-root /data/transparent-depth-assets --rank 0 --world 1 --device cuda:0 --expected-count 46679
 /envs/stage1/bin/python -m transparent_depth.stage1_batch seal \
   --manifest outputs/cleargrasp/rgb_only.jsonl --output outputs/caches/cleargrasp_p \
-  --asset-root artifacts --expected-count 46679
+  --asset-root /data/transparent-depth-assets --expected-count 46679
 /envs/stage2/bin/python -m transparent_depth.prepare_stage2_data \
   --input-roster outputs/cleargrasp/input_roster.jsonl \
   --label-roster outputs/cleargrasp/label_roster.jsonl \
