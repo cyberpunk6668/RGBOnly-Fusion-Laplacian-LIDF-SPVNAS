@@ -1,0 +1,25 @@
+{
+  "schema": "transparent_depth_release_v1",
+  "status": "selection_and_verification_pending",
+  "asset_root": "artifacts",
+  "stage1": {
+    "assets_manifest": "provenance/stage1_assets.json",
+    "laplacian_epoch": 8,
+    "frozen": true
+  },
+  "stage2": {
+    "bundle": "stage2",
+    "checkpoint_epoch": null,
+    "input_hw": [240, 320],
+    "full_image_refinement": true
+  },
+  "selection": {
+    "protocol": "post_hoc_selection_on_full1226",
+    "metric": "native_image_macro_transparent_mae_mm",
+    "direction": "minimum",
+    "epochs": [1, 80],
+    "images": 1226,
+    "checkpoint_epoch": null,
+    "independent_test_estimate": false
+  }
+}
